@@ -1,215 +1,112 @@
-"""Hermes PM V1: public wallet research and forward-only paper execution."""
-import json, os, re, sqlite3, threading, time, urllib.parse, urllib.request
-from datetime import datetime, timezone
+"""Hermes PM V2 HTTP dashboard. Public data in, paper ledger out."""
+import hmac, json, os, re, sqlite3, tempfile, threading, time, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-
-BASE = 'https://data-api.polymarket.com'
-CLOB = 'https://clob.polymarket.com'
-DB = os.getenv('DB_PATH', '/data/hermes_pm.sqlite3' if Path('/data').exists() else 'hermes_pm.sqlite3')
-WALLET = re.compile(r'^0x[a-fA-F0-9]{40}$')
-POLL = max(30, int(os.getenv('POLL_SECONDS', '90')))
-START_CASH = float(os.getenv('START_CASH', '1000'))
-MAX_TRADE = float(os.getenv('MAX_TRADE', '25'))
-MAX_OPEN = int(os.getenv('MAX_OPEN', '8'))
-MAX_SPREAD = float(os.getenv('MAX_SPREAD', '0.08'))
-MAX_AGE = int(os.getenv('MAX_SIGNAL_AGE_SECONDS', '300'))
-lock = threading.RLock()
-status = {'last_poll': None, 'last_error': None, 'mode': 'paper-only'}
+import engine as e
+import service
+WALLET=re.compile(r'^0x[a-fA-F0-9]{40}$')
 
 
-def connect():
-    db = sqlite3.connect(DB, timeout=20)
-    db.row_factory = sqlite3.Row
-    db.execute('PRAGMA journal_mode=WAL')
-    db.execute('PRAGMA busy_timeout=20000')
-    return db
-
-
-def init():
-    Path(DB).parent.mkdir(parents=True, exist_ok=True)
-    with connect() as db:
-        db.executescript('''
-        CREATE TABLE IF NOT EXISTS wallets(address TEXT PRIMARY KEY, label TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, auto INTEGER NOT NULL DEFAULT 0, added_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS signals(id TEXT PRIMARY KEY, address TEXT NOT NULL, ts INTEGER NOT NULL, side TEXT NOT NULL, asset TEXT NOT NULL, title TEXT NOT NULL, outcome TEXT NOT NULL, source_price REAL NOT NULL, source_size REAL NOT NULL, state TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', seen_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS fills(id INTEGER PRIMARY KEY AUTOINCREMENT, signal_id TEXT UNIQUE, address TEXT NOT NULL, asset TEXT NOT NULL, title TEXT NOT NULL, outcome TEXT NOT NULL, side TEXT NOT NULL, shares REAL NOT NULL, price REAL NOT NULL, cash_delta REAL NOT NULL, observed_at INTEGER NOT NULL, source_ts INTEGER NOT NULL, quote_type TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        INSERT OR IGNORE INTO settings VALUES ('cash', '1000');
-        ''')
-        if db.execute("SELECT COUNT(*) FROM fills").fetchone()[0] == 0:
-            db.execute("UPDATE settings SET value=? WHERE key='cash'", (str(START_CASH),))
-
-
-def api(host, path, params):
-    url = host + path + '?' + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={'User-Agent': 'HermesPM/1.0 research contact: local-owner', 'Accept': 'application/json'})
-    with urllib.request.urlopen(req, timeout=12) as res:
-        return json.load(res)
-
-
-def leaderboard():
-    return api(BASE, '/v1/leaderboard', {'timePeriod': 'MONTH', 'orderBy': 'PNL', 'limit': 20, 'offset': 0})
-
-
-def wallet_summary(address):
-    closed = api(BASE, '/closed-positions', {'user': address, 'limit': 100, 'offset': 0})
-    values = [float(p.get('realizedPnl') or 0) for p in closed]
-    wins = sum(v > 0 for v in values)
-    # Only sampled closed positions. Sum is not ROI and excludes open positions.
-    return {'sample_count': len(values), 'sample_realized_pnl': round(sum(values), 2), 'sample_win_rate': round(wins/len(values), 3) if values else None,
-            'coverage': 'últimas 100 posiciones cerradas; muestra parcial, no puntuación predictiva'}
-
-
-def book_price(asset, side):
-    book = api(CLOB, '/book', {'token_id': asset})
-    levels = book.get('asks' if side == 'BUY' else 'bids') or []
-    other = book.get('bids' if side == 'BUY' else 'asks') or []
-    if not levels or not other:
-        raise ValueError('sin contrapartida bid/ask')
-    best = min(levels, key=lambda x: float(x['price'])) if side == 'BUY' else max(levels, key=lambda x: float(x['price']))
-    opp = max(other, key=lambda x: float(x['price'])) if side == 'BUY' else min(other, key=lambda x: float(x['price']))
-    ask = float(best['price']) if side == 'BUY' else float(opp['price'])
-    bid = float(opp['price']) if side == 'BUY' else float(best['price'])
-    if ask - bid > MAX_SPREAD:
-        raise ValueError('spread demasiado amplio')
-    return float(best['price']), float(best['size'])
-
-
-def process_trade(db, address, trade, now, auto):
-    side = str(trade.get('side', '')).upper()
-    asset = str(trade.get('asset', ''))
-    ts = int(trade.get('timestamp') or 0)
-    source_price = float(trade.get('price') or 0)
-    source_size = float(trade.get('size') or 0)
-    if side not in ('BUY', 'SELL') or not asset.isdigit() or not 0 < source_price < 1 or source_size <= 0 or ts <= 0:
-        return
-    # Transaction hash alone can contain several fills; include stable trade fields.
-    sid = '|'.join(map(str, [trade.get('transactionHash', ''), address, asset, side, ts, source_price, source_size]))
-    if db.execute('SELECT 1 FROM signals WHERE id=?', (sid,)).fetchone():
-        return
-    age = now - ts
-    state, reason = ('observed', 'wallet in manual mode') if not auto else ('skipped', 'unavailable')
-    quote = None
-    if auto:
-        if age < 0 or age > MAX_AGE:
-            reason = 'señal antigua; no se ejecuta retrospectivamente'
-        elif side == 'SELL':
-            reason = 'ventas automáticas desactivadas en V1; posiciones requieren cierre manual'
-        else:
-            try:
-                price, available = book_price(asset, 'BUY')
-                held = db.execute('SELECT COALESCE(SUM(shares),0) FROM fills WHERE asset=?', (asset,)).fetchone()[0]
-                open_count = db.execute('SELECT COUNT(*) FROM (SELECT asset FROM fills GROUP BY asset HAVING SUM(shares)>0)').fetchone()[0]
-                cash = float(db.execute("SELECT value FROM settings WHERE key='cash'").fetchone()[0])
-                shares = min(MAX_TRADE/price, available, source_size, cash/price)
-                if open_count >= MAX_OPEN and held <= 0: reason = 'límite de posiciones abiertas'
-                elif shares*price < 1: reason = 'liquidez o efectivo insuficiente'
-                elif price > source_price + 0.05: reason = 'precio empeoró más de 5 centavos'
-                else:
-                    quote = (price, shares)
-                    state, reason = 'filled', 'paper fill al ask observado'
-            except Exception as exc:
-                reason = 'cotización no disponible: ' + str(exc)[:100]
-    db.execute('INSERT INTO signals VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', (sid, address, ts, side, asset, str(trade.get('title', ''))[:220], str(trade.get('outcome', ''))[:60], source_price, source_size, state, reason, now))
-    if quote:
-        price, shares = quote
-        db.execute('INSERT INTO fills(signal_id,address,asset,title,outcome,side,shares,price,cash_delta,observed_at,source_ts,quote_type) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
-                   (sid, address, asset, str(trade.get('title', ''))[:220], str(trade.get('outcome', ''))[:60], 'BUY', shares, price, -shares*price, now, ts, 'best ask at poll; no depth replay'))
-        db.execute("UPDATE settings SET value=CAST(value AS REAL)-? WHERE key='cash'", (shares*price,))
-
-
-def poll():
-    now = int(time.time())
-    with lock, connect() as db:
-        wallets = db.execute('SELECT * FROM wallets WHERE enabled=1').fetchall()
-        for wallet in wallets:
-            try:
-                trades = api(BASE, '/trades', {'user': wallet['address'], 'limit': 100, 'offset': 0, 'takerOnly': 'true'})
-                for trade in sorted(trades, key=lambda t: int(t.get('timestamp') or 0)):
-                    process_trade(db, wallet['address'], trade, now, bool(wallet['auto']))
-                db.commit()
-            except Exception as exc:
-                status['last_error'] = f"{wallet['label']}: {exc}"[:240]
-        status['last_poll'] = now
-
-
-def worker():
-    while True:
-        try: poll()
-        except Exception as exc: status['last_error'] = str(exc)[:240]
-        time.sleep(POLL)
+def state():
+    now=int(time.time())
+    with e.LOCK,e.database() as db:
+        portfolios=e.portfolios(db,now)
+        stats={p:dict(db.execute('SELECT COUNT(*) fills,COALESCE(SUM(CASE side WHEN \'SELL\' THEN 1 ELSE 0 END),0) exits,AVG(ts-source_ts) latency FROM pm_fills WHERE portfolio=?',(p,)).fetchone()) for p in e.POLICIES}
+        for p in portfolios:p.update(stats[p['id']])
+        return dict(status=service.STATE,portfolios=portfolios,
+            wallets=[dict(x) for x in db.execute('SELECT * FROM pm_wallets ORDER BY added DESC')],
+            candidates=[dict(x) for x in db.execute('SELECT * FROM pm_candidates ORDER BY eligible DESC,score DESC,pnl DESC LIMIT 200')],
+            orders=[dict(x) for x in db.execute('SELECT * FROM pm_orders ORDER BY created DESC LIMIT 200')],
+            fills=[dict(x) for x in db.execute('SELECT * FROM pm_fills ORDER BY id DESC LIMIT 200')],
+            signals=[dict(x) for x in db.execute('SELECT * FROM pm_signals ORDER BY detected DESC LIMIT 100')],
+            audit=[dict(x) for x in db.execute('SELECT * FROM pm_audit ORDER BY id DESC LIMIT 60')],
+            equity=[dict(x) for x in db.execute('SELECT * FROM (SELECT * FROM pm_equity ORDER BY ts DESC LIMIT 3000) ORDER BY ts')],
+            totals=dict(db.execute('SELECT (SELECT COUNT(*) FROM pm_candidates) candidates,(SELECT COUNT(*) FROM pm_signals) signals,(SELECT COUNT(*) FROM pm_fills) fills').fetchone()),
+            limits=e.LIMITS,automation=db.execute("SELECT v FROM pm_meta WHERE k='automation'").fetchone()[0]=='1',
+            storage={'persistent_mount':Path('/data').is_mount(),'db_path':e.DB,'size_mb':round(Path(e.DB).stat().st_size/1048576,2)},
+            assumptions=['Copia proporcional base: 1% de shares, con límites acumulados.',
+            'Simulación con profundidad visible y comisiones equivalentes en efectivo; no replica colas ni impacto futuro.',
+            'Sin arbitraje ni mercados neg-risk. Ventas pendientes se reintentan hasta liquidez o resolución.',
+            'Candidatos por muestra parcial de 50 cierres: sesgo de selección; score exploratorio.',
+            'Valoración incompleta si faltan cotizaciones recientes o profundidad para liquidar.',
+            'Adaptativa: espera 14 días y 20 mercados con salidas en referencia; ajustes diarios limitados.',
+            'Copias de respaldo diarias en el mismo volumen, últimas 3. Descarga externa disponible.'])
 
 
 class Handler(BaseHTTPRequestHandler):
-    def respond(self, code, data):
-        body = json.dumps(data, ensure_ascii=False).encode()
-        self.send_response(code)
-        self.send_header('Content-Type', 'application/json; charset=utf-8')
-        self.send_header('Cache-Control', 'no-store')
-        self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('Content-Length', str(len(body)))
-        self.end_headers(); self.wfile.write(body)
+    def output(self,code,body,kind='application/json; charset=utf-8',extra=None):
+        if not isinstance(body,bytes):body=json.dumps(body,ensure_ascii=False,allow_nan=False).encode()
+        self.send_response(code);self.send_header('Content-Type',kind);self.send_header('Cache-Control','no-store')
+        self.send_header('X-Content-Type-Options','nosniff');self.send_header('X-Frame-Options','DENY')
+        self.send_header('Content-Length',str(len(body)))
+        for k,v in (extra or {}).items():self.send_header(k,v)
+        self.end_headers();self.wfile.write(body)
 
     def auth(self):
-        key = os.getenv('HERMES_PM_KEY', '')
-        if not key: return False
-        import hmac
-        return hmac.compare_digest(self.headers.get('X-Hermes-Key', ''), key)
+        key=os.getenv('HERMES_PM_KEY','')
+        return bool(key) and hmac.compare_digest(self.headers.get('X-Hermes-Key',''),key)
 
     def do_GET(self):
-        path = urllib.parse.urlparse(self.path).path
-        if path == '/health': return self.respond(200, {'ok': True, 'mode': 'paper-only'})
-        if path == '/':
-            body = Path(__file__).with_name('static').joinpath('index.html').read_bytes()
-            self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8'); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body); return
-        if not self.auth(): return self.respond(401, {'error': 'Clave requerida'})
+        path=urllib.parse.urlparse(self.path).path
+        if path=='/health':return self.output(200,{'ok':True,'version':'2.0.0','mode':'paper-only','last_poll':service.STATE['last_poll']})
+        if path=='/':return self.output(200,Path(__file__).with_name('static').joinpath('index.html').read_bytes(),'text/html; charset=utf-8')
+        if not self.auth():return self.output(401,{'error':'Clave requerida'})
         try:
-            if path == '/api/leaderboard': return self.respond(200, leaderboard())
-            if path.startswith('/api/wallet/'):
-                address = path.rsplit('/', 1)[-1]
-                if not WALLET.fullmatch(address): return self.respond(400, {'error': 'wallet inválida'})
-                return self.respond(200, wallet_summary(address))
-            if path == '/api/state':
-                with lock, connect() as db:
-                    wallets = [dict(x) for x in db.execute('SELECT * FROM wallets ORDER BY added_at DESC')]
-                    signals = [dict(x) for x in db.execute('SELECT * FROM signals ORDER BY seen_at DESC LIMIT 100')]
-                    fills = [dict(x) for x in db.execute('SELECT * FROM fills ORDER BY id DESC LIMIT 100')]
-                    cash = float(db.execute("SELECT value FROM settings WHERE key='cash'").fetchone()[0])
-                    positions = [dict(x) for x in db.execute('SELECT asset,title,outcome,SUM(shares) shares,SUM(-cash_delta) cost FROM fills GROUP BY asset HAVING SUM(shares)>0')]
-                return self.respond(200, {'status': status, 'cash': cash, 'positions': positions, 'wallets': wallets, 'signals': signals, 'fills': fills,
-                                          'note': 'P&L no calculado: posiciones sin marcado fiable a mercado. Fills usan ask observado, no garantizan ejecución real.'})
-            return self.respond(404, {'error': 'ruta desconocida'})
-        except Exception as exc: return self.respond(502, {'error': str(exc)[:200]})
+            if path=='/api/state':return self.output(200,state())
+            if path=='/api/backup':
+                with tempfile.TemporaryDirectory() as temp:
+                    file=Path(temp)/'hermes-pm.sqlite3'
+                    with e.LOCK,e.database() as db:
+                        with sqlite3.connect(file) as out:db.backup(out)
+                    return self.output(200,file.read_bytes(),'application/octet-stream',{'Content-Disposition':'attachment; filename="hermes-pm-backup.sqlite3"'})
+            return self.output(404,{'error':'Ruta desconocida'})
+        except Exception as exc:return self.output(500,{'error':str(exc)[:250]})
 
     def do_POST(self):
-        if not self.auth(): return self.respond(401, {'error': 'Clave requerida'})
+        if not self.auth():return self.output(401,{'error':'Clave requerida'})
         try:
-            length = int(self.headers.get('Content-Length', '0'))
-            if length > 4096: return self.respond(413, {'error': 'payload demasiado grande'})
-            data = json.loads(self.rfile.read(length) or b'{}')
-            path = urllib.parse.urlparse(self.path).path
-            if path == '/api/wallets':
-                address = str(data.get('address', '')).lower()
-                if not WALLET.fullmatch(address): return self.respond(400, {'error': 'dirección EVM inválida'})
-                label = str(data.get('label') or address[:10])[:50]
-                with lock, connect() as db:
-                    db.execute('INSERT INTO wallets(address,label,enabled,auto,added_at) VALUES(?,?,1,0,?) ON CONFLICT(address) DO UPDATE SET label=excluded.label,enabled=1', (address,label,int(time.time())))
-                return self.respond(200, {'ok': True, 'auto': False})
-            if path == '/api/wallet-mode':
-                address = str(data.get('address','')).lower()
-                if not WALLET.fullmatch(address): return self.respond(400, {'error': 'wallet inválida'})
-                with lock, connect() as db:
-                    db.execute('UPDATE wallets SET auto=? WHERE address=?', (1 if data.get('auto') is True else 0,address))
-                return self.respond(200, {'ok': True})
-            if path == '/api/remove-wallet':
-                address = str(data.get('address','')).lower()
-                with lock, connect() as db: db.execute('UPDATE wallets SET enabled=0,auto=0 WHERE address=?', (address,))
-                return self.respond(200, {'ok': True})
-            return self.respond(404, {'error': 'ruta desconocida'})
-        except Exception as exc: return self.respond(400, {'error': str(exc)[:200]})
+            size=int(self.headers.get('Content-Length','0'))
+            if not 0<=size<=4096:return self.output(413,{'error':'Solicitud demasiado grande'})
+            data=json.loads(self.rfile.read(size) or b'{}');path=urllib.parse.urlparse(self.path).path
+            if not isinstance(data,dict):raise ValueError('Objeto JSON requerido')
+            address=str(data.get('address','')).lower();now=int(time.time())
+            with e.LOCK,e.database() as db:
+                if path in ('/api/wallets','/api/wallet-mode','/api/remove-wallet','/api/rebaseline'):
+                    if not WALLET.fullmatch(address):raise ValueError('Dirección EVM inválida')
+                    if path=='/api/wallets':
+                        count=db.execute('SELECT COUNT(*) FROM pm_wallets WHERE enabled=1').fetchone()[0]
+                        if count>=20 and not db.execute('SELECT 1 FROM pm_wallets WHERE address=?',(address,)).fetchone():raise ValueError('Máximo 20 wallets vigiladas en V2')
+                        e.add_wallet(db,address,str(data.get('label') or address[:10]),False)
+                    else:
+                        if not db.execute('SELECT 1 FROM pm_wallets WHERE address=?',(address,)).fetchone():raise ValueError('Wallet inexistente')
+                        if path=='/api/wallet-mode':
+                            auto=int(data.get('auto') is True)
+                            db.execute('UPDATE pm_wallets SET auto=?,enabled=1 WHERE address=?',(auto,address))
+                            e.note(db,'wallet_mode',address+' auto='+str(auto),now)
+                        elif path=='/api/remove-wallet':
+                            db.execute('UPDATE pm_wallets SET enabled=0,auto=0 WHERE address=?',(address,))
+                            e.note(db,'wallet_paused',address+' exits remain active',now)
+                        else:
+                            db.execute('DELETE FROM pm_source WHERE address=?',(address,))
+                            db.execute("UPDATE pm_wallets SET ready=0,blocked=0,error='' WHERE address=?",(address,))
+                            db.execute("UPDATE pm_orders SET state='cancelled',reason='nueva línea base' WHERE address=? AND side='BUY' AND state='pending'",(address,))
+                            e.note(db,'rebaseline_requested',address,now)
+                elif path=='/api/close':
+                    p=data.get('portfolio');asset=str(data.get('asset',''))
+                    if p not in e.POLICIES or not WALLET.fullmatch(address) or not asset.isdigit():raise ValueError('Posición inválida')
+                    e.close_position(db,p,address,asset,now)
+                elif path=='/api/automation':
+                    db.execute("UPDATE pm_meta SET v=? WHERE k='automation'",('1' if data.get('enabled') is True else '0',))
+                    e.note(db,'automation',str(data.get('enabled') is True),now)
+                else:return self.output(404,{'error':'Ruta desconocida'})
+            service.WAKE.set()
+            return self.output(200,{'ok':True})
+        except (ValueError,TypeError,KeyError) as exc:return self.output(400,{'error':str(exc)[:200]})
+        except Exception as exc:return self.output(500,{'error':str(exc)[:200]})
 
 
-if __name__ == '__main__':
-    init()
-    threading.Thread(target=worker, daemon=True).start()
-    ThreadingHTTPServer(('0.0.0.0', int(os.getenv('PORT', '8000'))), Handler).serve_forever()
+if __name__=='__main__':
+    e.init()
+    threading.Thread(target=service.worker,daemon=True).start()
+    threading.Thread(target=service.research_worker,daemon=True).start()
+    ThreadingHTTPServer(('0.0.0.0',int(os.getenv('PORT','8000'))),Handler).serve_forever()
