@@ -26,7 +26,7 @@ def state():
             storage={'persistent_mount':Path('/data').is_mount(),'db_path':e.DB,'size_mb':round(Path(e.DB).stat().st_size/1048576,2)},
             assumptions=['Copia proporcional base: 1% de shares, con límites acumulados.',
             'Simulación con profundidad visible y comisiones equivalentes en efectivo; no replica colas ni impacto futuro.',
-            'Sin arbitraje ni mercados neg-risk. Ventas pendientes se reintentan hasta liquidez o resolución.',
+            'Neg-risk estándar permitido con evento padre verificado. Conversiones y transacciones con varios activos no se copian.',
             'Candidatos por muestra parcial de 50 cierres: sesgo de selección; score exploratorio.',
             'Valoración incompleta si faltan cotizaciones recientes o profundidad para liquidar.',
             'Adaptativa: espera 14 días y 20 mercados con salidas en referencia; ajustes diarios limitados.',
@@ -48,7 +48,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path=urllib.parse.urlparse(self.path).path
-        if path=='/health':return self.output(200,{'ok':True,'version':'2.0.1','mode':'paper-only','last_poll':service.STATE['last_poll']})
+        if path=='/health':return self.output(200,{'ok':True,'version':'2.1.0','mode':'paper-only','last_poll':service.STATE['last_poll']})
         if path=='/':return self.output(200,Path(__file__).with_name('static').joinpath('index.html').read_bytes(),'text/html; charset=utf-8')
         if not self.auth():return self.output(401,{'error':'Clave requerida'})
         try:
@@ -88,6 +88,7 @@ class Handler(BaseHTTPRequestHandler):
                             e.note(db,'wallet_paused',address+' exits remain active',now)
                         else:
                             db.execute('DELETE FROM pm_source WHERE address=?',(address,))
+                            db.execute('DELETE FROM pm_meta WHERE k=?',('strategy_block:'+address,))
                             db.execute("UPDATE pm_wallets SET ready=0,blocked=0,error='' WHERE address=?",(address,))
                             db.execute("UPDATE pm_orders SET state='cancelled',reason='nueva línea base' WHERE address=? AND side='BUY' AND state='pending'",(address,))
                             e.note(db,'rebaseline_requested',address,now)

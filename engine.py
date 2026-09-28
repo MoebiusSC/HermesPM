@@ -113,12 +113,14 @@ def signal(db,w,t,now):
     before=source_qty(db,address,asset)
     market=str(t.get('conditionId') or asset); event=str(t.get('eventSlug') or market)
     title=str(t.get('title',''))[:240]; outcome=str(t.get('outcome',''))[:80]
-    reason=''
+    reason=t.get('_complex_reason','')
+    if w.get('strategy_blocked'):reason='inventario alterado por conversión/split/merge; requiere nueva línea base'
     if not w['ready'] or ts<=w['buy_after']: reason='antes del inicio de seguimiento; solo observación'
     db.execute('INSERT INTO pm_signals VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(sid,address,asset,market,event,title,outcome,side,qty,price,ts,now,before,reason))
     # Initial baseline is already a snapshot of all prior positions.
     if ts<=w['buy_after'] or not w['ready']: return
     set_source(db,address,asset,before+qty if side=='BUY' else before-qty)
+    if reason:return
     for p in POLICIES:
         own=position(db,p,address,asset)
         if side=='BUY':
@@ -197,12 +199,14 @@ def execute(db,o,quote,now):
     if quote.get('settlement') is not None: return
     if quote.get('fee_rate') is None:
         db.execute("UPDATE pm_orders SET reason='comisión no verificada; sin ejecución' WHERE id=?",(o['id'],)); return
+    if o['side']=='BUY' and w['error']:
+        db.execute("UPDATE pm_orders SET reason='lectura de wallet incompleta; esperando validación' WHERE id=?",(o['id'],));return
     asks=quote.get('asks',[]); bids=quote.get('bids',[])
     side=o['side']; filtered=o['portfolio']!='reference'
     if side=='BUY':
         if not asks or not bids: return
         if quote.get('complex'):
-            db.execute("UPDATE pm_orders SET state='rejected',reason='mercado complejo / neg-risk excluido' WHERE id=?",(o['id'],)); return
+            db.execute("UPDATE pm_orders SET state='rejected',reason=? WHERE id=?",(quote.get('risk_reason') or 'estructura compleja no soportada',o['id'])); return
         spread=min(p for p,q in asks)-max(p for p,q in bids)
         if filtered and spread>LIMITS['spread']:
             db.execute("UPDATE pm_orders SET reason='spread excesivo' WHERE id=?",(o['id'],)); return

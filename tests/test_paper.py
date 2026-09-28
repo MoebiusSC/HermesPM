@@ -26,6 +26,21 @@ class PaperTest(unittest.TestCase):
             self.register(db,self.trade(qty=100));q=self.quote();q['min_order_size']=5
             self.execute_all(db,q)
             self.assertEqual(db.execute('SELECT COUNT(*) FROM pm_fills').fetchone()[0],0)
+    def test_standard_neg_risk_paper_execution(self):
+        with e.database() as db:
+            self.register(db,self.trade());q=self.quote();q.update(neg_risk=True,complex=False,event='event:42')
+            self.execute_all(db,q)
+            self.assertAlmostEqual(e.position(db,'filtered',self.address,'123')['qty'],10)
+    def test_multileg_signal_observed_not_copied(self):
+        with e.database() as db:
+            t=self.trade();t['_complex_reason']='multiple assets';self.register(db,t)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM pm_orders').fetchone()[0],0)
+            self.assertEqual(e.source_qty(db,self.address,'123'),1000)
+    def test_conversion_guard_blocks_source_dependent_orders(self):
+        with e.database() as db:
+            w=dict(db.execute('SELECT * FROM pm_wallets').fetchone());w['strategy_blocked']=True
+            e.signal(db,w,self.trade(),self.now)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM pm_orders').fetchone()[0],0)
     def test_duplicate_and_fee_accounting(self):
         with e.database() as db:
             t=self.trade();self.register(db,t);self.register(db,t);self.execute_all(db,self.quote(rate=.07))

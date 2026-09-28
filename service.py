@@ -5,7 +5,7 @@ import engine as e
 import provider as api
 POLL=max(10,int(os.getenv('POLL_SECONDS','20')))
 WAKE=threading.Event()
-STATE={'last_poll':None,'last_error':None,'last_discovery':None,'research_error':None,'cycle_seconds':0,'mode':'paper-only','version':'2.0.1'}
+STATE={'last_poll':None,'last_error':None,'last_discovery':None,'research_error':None,'cycle_seconds':0,'mode':'paper-only','version':'2.1.0'}
 
 
 def collect(w,now):
@@ -13,7 +13,8 @@ def collect(w,now):
         holdings=api.positions(w['address'])
         # Barrier after snapshot prevents backfilling historical trades into paper.
         return {'baseline':holdings,'barrier':int(time.time())}
-    return {'trades':api.trades(w['address'],w['cursor'],now)}
+    activity=api.complex_activity(w['address'],w['cursor'],now)
+    return {'trades':api.trades(w['address'],w['cursor'],now),'activity':activity}
 
 
 def cycle():
@@ -33,6 +34,17 @@ def cycle():
                         db.execute('UPDATE pm_wallets SET ready=1,cursor=?,buy_after=?,last_poll=?,last_reconcile=?,error=? WHERE address=?',(result['barrier'],result['barrier'],now,now,'',w['address']))
                         e.note(db,'baseline',w['address']+' '+str(len(result['baseline']))+' positions',now)
                     else:
+                        complex_rows=[r for r in result.get('activity',[]) if int(r.get('timestamp') or 0)>w['buy_after']]
+                        if complex_rows:
+                            marker='strategy_block:'+w['address']
+                            detail=','.join(sorted({r['type'] for r in complex_rows}))
+                            if not db.execute('SELECT 1 FROM pm_meta WHERE k=?',(marker,)).fetchone():
+                                db.execute('INSERT INTO pm_meta VALUES(?,?)',(marker,detail))
+                                e.note(db,'complex_activity',w['address']+' '+detail,now)
+                            db.execute('UPDATE pm_wallets SET blocked=1,error=? WHERE address=?',('conversión/split/merge detectado; nueva línea base requerida',w['address']))
+                            db.execute("UPDATE pm_orders SET state='cancelled',reason='inventario afectado por operación compleja' WHERE address=? AND side='BUY' AND state='pending'",(w['address'],))
+                            w['blocked']=1
+                        w['strategy_blocked']=bool(db.execute('SELECT 1 FROM pm_meta WHERE k=?',('strategy_block:'+w['address'],)).fetchone())
                         for t in result['trades']:e.signal(db,w,t,int(time.time()))
                         db.execute('UPDATE pm_wallets SET cursor=?,last_poll=? WHERE address=?',(now,now,w['address']))
                         if not w['blocked']:db.execute("UPDATE pm_wallets SET error='' WHERE address=?",(w['address'],))
@@ -82,7 +94,7 @@ def reconcile():
                     # Snapshot can race incoming trades; block entries, don't fabricate exits.
                     db.execute('UPDATE pm_wallets SET blocked=1,error=? WHERE address=?',('diferencia de inventario; entradas pausadas hasta reconciliar',w['address']))
                     e.note(db,'reconcile_difference',json.dumps({'address':w['address'],'differences':dict(list(diff.items())[:10])}))
-                else:
+                elif not db.execute('SELECT 1 FROM pm_meta WHERE k=?',('strategy_block:'+w['address'],)).fetchone():
                     db.execute("UPDATE pm_wallets SET blocked=0,error='' WHERE address=?",(w['address'],))
                 db.execute('UPDATE pm_wallets SET last_reconcile=? WHERE address=?',(int(time.time()),w['address']))
         except Exception as exc:

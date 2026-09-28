@@ -6,6 +6,18 @@ import provider as p
 
 class ProviderTest(unittest.TestCase):
     def setUp(self):p._cache.clear()
+    def test_standard_neg_risk_allowed_and_grouped(self):
+        a=p.market_risk({'negRisk':True,'events':[{'id':'42','slug':'election'}]},'market-a')
+        b=p.market_risk({'negRisk':True,'events':[{'id':'42','slug':'election'}]},'market-b')
+        self.assertFalse(a['complex']);self.assertEqual(a['event'],b['event'])
+    def test_augmented_or_missing_parent_stays_blocked(self):
+        self.assertTrue(p.market_risk({'negRisk':True},'m')['complex'])
+        self.assertTrue(p.market_risk({'negRisk':True,'events':[{'id':'42','negRiskAugmented':True}]},'m')['complex'])
+    def test_multileg_transaction_flagged(self):
+        rows=[{'transactionHash':'tx','asset':'123','timestamp':100},{'transactionHash':'tx','asset':'456','timestamp':100}]
+        with patch.object(p,'paged',return_value=(rows,True)):
+            result=p.trades('wallet',90,110)
+            self.assertTrue(all(r.get('_complex_reason') for r in result))
     def test_final_resolution_required(self):
         market={'conditionId':'c','closed':True,'umaResolutionStatus':'proposed','clobTokenIds':'["123","456"]','outcomePrices':'["1","0"]','feesEnabled':False}
         def fake(host,path,params=None):return [market] if host==p.GAMMA else {'asks':[],'bids':[]}

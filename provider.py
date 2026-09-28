@@ -47,8 +47,34 @@ def trades(address,cursor,now):
     # Overlap accommodates delayed indexing; older items deduplicated by engine.
     rows,complete=paged('/trades',{'user':address,'takerOnly':'false','start':max(0,cursor-300),'end':now},100,10)
     if not complete: raise ValueError('trade pagination cap; cursor retained, entries blocked')
+    legs={}
+    for t in rows:
+        tx=t.get('transactionHash')
+        if tx:legs.setdefault(tx,set()).add(str(t.get('asset')))
+    for t in rows:
+        if len(legs.get(t.get('transactionHash'),set()))>1:
+            t['_complex_reason']='transacción con varios activos; copia combinada no soportada'
     return sorted(rows,key=lambda t:(int(t.get('timestamp') or 0),str(t.get('transactionHash','')),str(t.get('asset',''))))
 
+
+
+def complex_activity(address,cursor,now):
+    rows,complete=paged('/activity',{'user':address,'type':'CONVERSION,SPLIT,MERGE','start':max(0,cursor-300),'end':now,'sortBy':'TIMESTAMP','sortDirection':'ASC'},100,10)
+    if not complete:raise ValueError('activity pagination cap; complex strategy check incomplete')
+    return [r for r in rows if r.get('type') in ('CONVERSION','SPLIT','MERGE')]
+
+
+def market_risk(m,condition):
+    events=m.get('events') or []
+    # Use the canonical parent event ID across all outcome markets.
+    event_id=events[0].get('id') if len(events)==1 else None
+    event_slug=events[0].get('slug') if len(events)==1 else None
+    neg=bool(m.get('negRisk'))
+    event=('event:'+str(event_id)) if event_id is not None else (str(event_slug) if event_slug else condition)
+    augmented=bool(m.get('negRiskAugmented')) or any(bool(x.get('negRiskAugmented')) for x in events)
+    reason='mercado neg-risk aumentado; estructura no soportada' if augmented else ''
+    if neg and not (event_id is not None or event_slug):reason='neg-risk sin evento padre verificable'
+    return dict(event=event,neg_risk=neg,complex=bool(reason),risk_reason=reason)
 
 def discovery():
     def batch(offset): return listing(get(DATA,'/v1/leaderboard',{'category':'OVERALL','timePeriod':'MONTH','orderBy':'PNL','limit':50,'offset':offset}))
@@ -101,7 +127,7 @@ def quote(asset,condition):
     if m.get('closed') is True and str(m.get('umaResolutionStatus','')).lower()=='resolved' and asset in tokens and len(tokens)==len(prices):
         payouts=[float(p) for p in prices]
         if all(p in (0.,.5,1.) for p in payouts) and abs(sum(payouts)-1)<1e-6:settlement=payouts[tokens.index(asset)]
-    result=dict(ts=int(time.time()),asks=[],bids=[],fee_rate=rate,fee_exponent=exponent,settlement=settlement,complex=bool(m.get('negRisk')),event=str((m.get('events') or [{}])[0].get('slug') or condition))
+    result=dict(ts=int(time.time()),asks=[],bids=[],fee_rate=rate,fee_exponent=exponent,settlement=settlement,**market_risk(m,condition))
     if settlement is not None:return result
     book=get(CLOB,'/book',{'token_id':asset})
     for key in ('asks','bids'):
