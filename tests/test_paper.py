@@ -21,6 +21,11 @@ class PaperTest(unittest.TestCase):
     def execute_all(self,db,quote=None,p='filtered'):
         q=copy.deepcopy(quote or self.quote())
         for row in db.execute("SELECT * FROM pm_orders WHERE portfolio=? AND state='pending' ORDER BY created,id",(p,)).fetchall():e.execute(db,dict(row),q,self.now)
+    def test_minimum_order_size_blocks_dust(self):
+        with e.database() as db:
+            self.register(db,self.trade(qty=100));q=self.quote();q['min_order_size']=5
+            self.execute_all(db,q)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM pm_fills').fetchone()[0],0)
     def test_duplicate_and_fee_accounting(self):
         with e.database() as db:
             t=self.trade();self.register(db,t);self.register(db,t);self.execute_all(db,self.quote(rate=.07))

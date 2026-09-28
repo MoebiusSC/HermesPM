@@ -106,6 +106,7 @@ def quote(asset,condition):
     book=get(CLOB,'/book',{'token_id':asset})
     for key in ('asks','bids'):
         result[key]=[[float(l['price']),float(l['size'])] for l in book.get(key,[]) if math.isfinite(float(l['price'])) and math.isfinite(float(l['size']))]
+    result['min_order_size']=float(book.get('min_order_size') or m.get('orderMinSize') or 0)
     raw=book.get('timestamp')
     if raw:
         stamp=float(raw);stamp=stamp/1000 if stamp>1e12 else stamp

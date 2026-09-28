@@ -224,8 +224,12 @@ def execute(db,o,quote,now):
         budget=float('inf'); cap=0.000001; wanted=min(o['remaining'],position(db,o['portfolio'],o['address'],o['asset'])['qty'])
         if wanted<=EPS:
             db.execute("UPDATE pm_orders SET state='cancelled',reason='posición ya cerrada' WHERE id=?",(o['id'],));return
+    if wanted+EPS<quote.get('min_order_size',0):
+        db.execute("UPDATE pm_orders SET reason='cantidad inferior al mínimo de mercado' WHERE id=?",(o['id'],));return
     levels=asks if side=='BUY' else bids
     qty,notional,fee=consume(levels,side,wanted,budget,quote['fee_rate'],quote.get('fee_exponent',1),cap)
+    if side=='BUY' and notional<1:
+        db.execute("UPDATE pm_orders SET reason='compra inferior a 1 USDC' WHERE id=?",(o['id'],));return
     if qty<=EPS:
         db.execute("UPDATE pm_orders SET reason='sin profundidad dentro del precio permitido' WHERE id=?",(o['id'],)); return
     apply_fill(db,o,qty,notional,fee,now,quote['ts'],'depth-v2; fee cash-equivalent; no queue simulation')
