@@ -40,3 +40,6 @@ https://docs.polymarket.com/market-data/market-details
 https://docs.polymarket.com/trading/fees
 
 Legacy data routes remain isolated in provider.py for migration to v2 when its contract is tested.
+
+### 2.1.2 · recuperación de mercado cerrado
+Cuando Gamma oculta mercados cerrados del listado predeterminado se vuelve a consultar con `closed=true`; la liquidación requiere `umaResolutionStatus=resolved` y pagos válidos. La reconciliación solo limpia inventario público ausente si el token está oficialmente resuelto; las diferencias inciertas continúan bloqueadas.

@@ -104,6 +104,10 @@ def metadata(condition):
         if hit and time.time()-hit[0]<300:return hit[1]
     rows=listing(get(GAMMA,'/markets',{'condition_ids':condition}))
     match=next((m for m in rows if m.get('conditionId')==condition),None)
+    if not match:
+        # Gamma hides closed markets from its default listing.
+        closed=listing(get(GAMMA,'/markets',{'condition_ids':condition,'closed':'true'}))
+        match=next((m for m in closed if m.get('conditionId')==condition),None)
     if not match: raise ValueError('market metadata unavailable')
     with _lock:_cache[condition]=(time.time(),match)
     return match
@@ -111,6 +115,20 @@ def metadata(condition):
 
 def read_list(value):
     return json.loads(value) if isinstance(value,str) else (value or [])
+
+
+def resolved_asset(asset):
+    """Authoritatively identify a redeemed token absent from a source snapshot."""
+    rows=listing(get(GAMMA,'/markets',{'clob_token_ids':asset,'closed':'true'}))
+    for m in rows:
+        tokens=read_list(m.get('clobTokenIds'))
+        payouts=read_list(m.get('outcomePrices'))
+        if not (m.get('closed') is True and str(m.get('umaResolutionStatus','')).lower()=='resolved'
+                and asset in tokens and len(tokens)==len(payouts)):continue
+        try:values=[float(x) for x in payouts]
+        except (ValueError,TypeError):continue
+        if all(x in (0.,.5,1.) for x in values) and abs(sum(values)-1)<1e-6:return True
+    return False
 
 
 def quote(asset,condition):
