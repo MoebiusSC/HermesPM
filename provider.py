@@ -127,7 +127,7 @@ def quote(asset,condition):
     if m.get('closed') is True and str(m.get('umaResolutionStatus','')).lower()=='resolved' and asset in tokens and len(tokens)==len(prices):
         payouts=[float(p) for p in prices]
         if all(p in (0.,.5,1.) for p in payouts) and abs(sum(payouts)-1)<1e-6:settlement=payouts[tokens.index(asset)]
-    result=dict(ts=int(time.time()),asks=[],bids=[],fee_rate=rate,fee_exponent=exponent,settlement=settlement,**market_risk(m,condition))
+    result=dict(ts=int(time.time()),asks=[],bids=[],fee_rate=rate,fee_exponent=exponent,settlement=settlement,scheduled_end=m.get('endDate'),resolution_status=str(m.get('umaResolutionStatus') or ''),market_closed=bool(m.get('closed')),**market_risk(m,condition))
     if settlement is not None:return result
     book=get(CLOB,'/book',{'token_id':asset})
     for key in ('asks','bids'):

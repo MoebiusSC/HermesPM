@@ -5,7 +5,7 @@ import engine as e
 import provider as api
 POLL=max(10,int(os.getenv('POLL_SECONDS','20')))
 WAKE=threading.Event()
-STATE={'last_poll':None,'last_error':None,'last_discovery':None,'research_error':None,'cycle_seconds':0,'mode':'paper-only','version':'2.1.0'}
+STATE={'last_poll':None,'last_error':None,'last_discovery':None,'research_error':None,'cycle_seconds':0,'mode':'paper-only','version':'2.1.1'}
 
 
 def collect(w,now):

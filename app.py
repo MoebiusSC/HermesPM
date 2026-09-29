@@ -48,7 +48,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path=urllib.parse.urlparse(self.path).path
-        if path=='/health':return self.output(200,{'ok':True,'version':'2.1.0','mode':'paper-only','last_poll':service.STATE['last_poll']})
+        if path=='/health':return self.output(200,{'ok':True,'version':'2.1.1','mode':'paper-only','last_poll':service.STATE['last_poll']})
         if path=='/':return self.output(200,Path(__file__).with_name('static').joinpath('index.html').read_bytes(),'text/html; charset=utf-8')
         if not self.auth():return self.output(401,{'error':'Clave requerida'})
         try:

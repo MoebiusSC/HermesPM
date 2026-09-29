@@ -273,7 +273,7 @@ def portfolios(db,now,snapshot=False):
             # Valuation requires enough visible depth for this position; stale/missing -> unknown.
             qty,n,f=consume(bids,'SELL',item['qty'],float('inf'),fee_rate or 0,quote.get('fee_exponent',1),0)
             good=fresh and fee_rate is not None and qty>=item['qty']-EPS
-            item.update(mark=mark,value=n-f if good else None,unrealized=n-f-item['cost'] if good else None,quote_ts=q['ts'] if q else None,liquidatable_shares=qty if fresh else 0)
+            item.update(scheduled_end=quote.get('scheduled_end'),resolution_status=quote.get('resolution_status',''),market_closed=quote.get('market_closed',False),mark=mark,value=n-f if good else None,unrealized=n-f-item['cost'] if good else None,quote_ts=q['ts'] if q else None,liquidatable_shares=qty if fresh else 0)
             if good:
                 value+=n-f
                 left=qty
